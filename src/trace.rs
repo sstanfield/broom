@@ -41,25 +41,30 @@ pub trait Trace<T: Trace<T>> {
 /// tracing, look at the [`Trace`] trait instead.
 pub struct Tracer<'a, T: Trace<T>> {
     pub(crate) new_sweep: usize,
-    pub(crate) object_sweeps: &'a mut HashMap<Handle<T>, usize>,
-    pub(crate) objects: &'a HashSet<Handle<T>>,
+    pub(crate) object_sweeps: &'a mut HashMap<usize, usize>,
+    //pub(crate) objects: &'a Vec<RefCell<T>>,
+    pub(crate) objects: &'a Vec<Arc<RwLock<T>>>,
+    pub(crate) allocated: &'a HashSet<usize>,
 }
 
 impl<'a, T: Trace<T>> Tracer<'a, T> {
-    pub(crate) fn mark(&mut self, handle: Handle<T>) {
-        let sweep = self.object_sweeps
-            .entry(handle)
+    pub(crate) fn mark(&mut self, index: usize) {
+        let sweep = self
+            .object_sweeps
+            .entry(index)
             .or_insert(self.new_sweep - 1);
-        if *sweep != self.new_sweep && self.objects.contains(&handle) {
+        if *sweep != self.new_sweep && self.allocated.contains(&index) {
             *sweep = self.new_sweep;
-            unsafe { (&*handle.ptr).trace(self); }
+            //self.objects[index].borrow().trace(self);
+            //XXX FIX ME
+            self.objects[index].read().unwrap().trace(self);
         }
     }
 }
 
 impl<O: Trace<O>> Trace<O> for Handle<O> {
     fn trace(&self, tracer: &mut Tracer<O>) {
-        tracer.mark(*self);
+        tracer.mark(self.idx);
     }
 }
 
@@ -70,11 +75,7 @@ impl<O: Trace<O>> Trace<O> for Rooted<O> {
 }
 
 // Impl on standard things
-use std::collections::{
-    HashMap as StdHashMap,
-    VecDeque,
-    LinkedList,
-};
+use std::collections::{HashMap as StdHashMap, LinkedList, VecDeque};
 
 impl<O: Trace<O>, T: Trace<O>> Trace<O> for [T] {
     fn trace(&self, tracer: &mut Tracer<O>) {
@@ -100,7 +101,7 @@ impl<O: Trace<O>, K, V: Trace<O>> Trace<O> for StdHashMap<K, V> {
     }
 }
 
-impl<O: Trace<O>, T: Trace<O>> Trace<O> for HashSet<T> {
+impl<O: Trace<O>, T: Trace<O>, S: ::std::hash::BuildHasher> Trace<O> for HashSet<T, S> {
     fn trace(&self, tracer: &mut Tracer<O>) {
         self.iter().for_each(|object| object.trace(tracer));
     }

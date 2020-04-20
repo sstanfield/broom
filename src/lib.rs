@@ -54,25 +54,22 @@
 
 pub mod trace;
 
-use std::{
-    cmp::{PartialEq, Eq},
-    rc::Rc,
-    hash::{Hash, Hasher},
-};
-use hashbrown::{HashMap, HashSet};
 use crate::trace::*;
+use hashbrown::{HashMap, HashSet};
+use std::{
+    //cell::{Ref, RefCell, RefMut},
+    sync::{Arc, RwLock, RwLockWriteGuard, RwLockReadGuard},
+    //rc::Rc,
+    ops::{Deref, DerefMut},
+};
 
 /// Common items that you'll probably need often.
 pub mod prelude {
     pub use super::{
-        Heap,
-        Handle,
-        Rooted,
         trace::{Trace, Tracer},
+        Handle, Heap, Rooted, Obj, ObjMut
     };
 }
-
-type Generation = usize;
 
 /// A heap for storing objects.
 ///
@@ -83,10 +80,13 @@ type Generation = usize;
 /// you may not create trace routes (see [`Trace`]) that cross the boundary between different heaps.
 pub struct Heap<T> {
     last_sweep: usize,
-    object_sweeps: HashMap<Handle<T>, usize>,
-    obj_counter: Generation,
-    objects: HashSet<Handle<T>>,
-    rooted: HashMap<Handle<T>, Rc<()>>,
+    object_sweeps: HashMap<usize, usize>,
+    //objects: Vec<RefCell<T>>,
+    objects: Vec<Arc<RwLock<T>>>,
+    allocated: HashSet<usize>,
+    freed: Vec<usize>,
+    //rooted: HashMap<usize, Rc<()>>,
+    rooted: HashMap<usize, Arc<()>>,
 }
 
 impl<T> Default for Heap<T> {
@@ -94,8 +94,9 @@ impl<T> Default for Heap<T> {
         Self {
             last_sweep: 0,
             object_sweeps: HashMap::default(),
-            obj_counter: 0,
-            objects: HashSet::default(),
+            objects: Vec::default(),
+            allocated: HashSet::default(),
+            freed: Vec::default(),
             rooted: HashMap::default(),
         }
     }
@@ -103,25 +104,25 @@ impl<T> Default for Heap<T> {
 
 impl<T: Trace<T>> Heap<T> {
     /// Create an empty heap.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn new_generation(&mut self) -> Generation {
-        self.obj_counter += 1;
-        self.obj_counter
-    }
-
+    pub fn new() -> Self { Self::default() } 
     /// Adds a new object to this heap that will be cleared upon the next garbage collection, if
     /// not attached to the object tree.
     pub fn insert_temp(&mut self, object: T) -> Handle<T> {
-        let ptr = Box::into_raw(Box::new(object));
+        let idx = if let Some(idx) = self.freed.pop() {
+            self.objects.push(Arc::new(RwLock::new(object)));
+            self.objects.swap_remove(idx);
+            //self.objects[idx].replace(object);
+            idx
+        } else {
+            self.objects.push(Arc::new(RwLock::new(object)));
+            self.objects.len() - 1
+        };
+        self.allocated.insert(idx);
 
-        let gen = self.new_generation();
-        let handle = Handle { gen, ptr };
-        self.objects.insert(handle);
-
-        handle
+        Handle {
+            idx,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// Adds a new object to this heap that will not be cleared by garbage collection until all
@@ -129,13 +130,10 @@ impl<T: Trace<T>> Heap<T> {
     pub fn insert(&mut self, object: T) -> Rooted<T> {
         let handle = self.insert_temp(object);
 
-        let rc = Rc::new(());
-        self.rooted.insert(handle, rc.clone());
+        let rc = Arc::new(());
+        self.rooted.insert(handle.idx, rc.clone());
 
-        Rooted {
-            rc,
-            handle,
-        }
+        Rooted { rc, handle }
     }
 
     /// Upgrade a handle (that will be cleared by the garbage collector) into a rooted handle (that
@@ -145,9 +143,10 @@ impl<T: Trace<T>> Heap<T> {
         debug_assert!(self.contains(handle));
 
         Rooted {
-            rc: self.rooted
-                .entry(*handle)
-                .or_insert_with(|| Rc::new(()))
+            rc: self
+                .rooted
+                .entry(handle.idx)
+                .or_insert_with(|| Arc::new(()))
                 .clone(),
             handle: *handle,
         }
@@ -158,53 +157,45 @@ impl<T: Trace<T>> Heap<T> {
         self.objects.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
     /// Return true if the heap contains the specified handle
     pub fn contains(&self, handle: impl AsRef<Handle<T>>) -> bool {
         let handle = handle.as_ref();
-        self.objects.contains(&handle)
+        self.allocated.contains(&handle.idx)
     }
 
-    /// Get a reference to a heap object if it exists on this heap.
-    pub fn get(&self, handle: impl AsRef<Handle<T>>) -> Option<&T> {
+    /*pub fn get_obj(&self, handle: impl AsRef<Handle<T>>) -> Arc<RwLock<T>> {
         let handle = handle.as_ref();
-        if self.contains(handle) {
-            Some(unsafe { &*handle.ptr })
+        self.objects.get(handle.idx).expect("Invalid handle!").clone()
+    }*/
+
+    /// Get a reference to a heap object if it exists on this heap.
+    pub fn get(&self, handle: impl AsRef<Handle<T>>) -> Option<Obj<T>> {
+        let handle = handle.as_ref();
+        if let Some(obj) = self.objects.get(handle.idx) {
+            Some(Obj::new(obj.clone()))
         } else {
             None
         }
-    }
-
-    /// Get a reference to a heap object without checking whether it is still alive or that it
-    /// belongs to this heap.
-    ///
-    /// If either invariant is not upheld, calling this function results in undefined
-    /// behaviour.
-    pub unsafe fn get_unchecked(&self, handle: impl AsRef<Handle<T>>) -> &T {
-        let handle = handle.as_ref();
-        debug_assert!(self.contains(handle));
-        &*handle.ptr
     }
 
     /// Get a mutable reference to a heap object
-    pub fn get_mut(&mut self, handle: impl AsRef<Handle<T>>) -> Option<&mut T> {
+    pub fn get_mut(&self, handle: impl AsRef<Handle<T>>) -> Option<ObjMut<T>> {
         let handle = handle.as_ref();
-        if self.contains(handle) {
-            Some(unsafe { &mut *handle.ptr })
+        if let Some(obj) = self.objects.get(handle.idx) {
+            Some(ObjMut::new(obj.clone()))
         } else {
             None
         }
     }
 
-    /// Get a mutable reference to a heap object without first checking that it is still alive or
-    /// that it belongs to this heap.
-    ///
-    /// If either invariant is not upheld, calling this function results in undefined
-    /// behaviour. Provided they are upheld, this function provides zero-cost access.
-    pub fn get_mut_unchecked(&mut self, handle: impl AsRef<Handle<T>>) -> &mut T {
+    /*pub fn as_ptr(&mut self, handle: impl AsRef<Handle<T>>) -> *mut T {
         let handle = handle.as_ref();
-        debug_assert!(self.contains(handle));
-        unsafe { &mut *handle.ptr }
-    }
+        self.objects[handle.idx].as_ptr()
+    }*/
 
     /// Clean orphaned objects from the heap, excluding those that can be reached from the given
     /// handle iterator.
@@ -212,50 +203,56 @@ impl<T: Trace<T>> Heap<T> {
     /// This function is useful in circumstances in which you wish to keep certain items alive over
     /// a garbage collection without the addition cost of a [`Rooted`] handle. An example of this
     /// might be stack items in a garbage-collected language
-    pub fn clean_excluding(&mut self, excluding: impl IntoIterator<Item=Handle<T>>) {
+    pub fn clean_excluding(&mut self, excluding: impl IntoIterator<Item = Handle<T>>) {
         let new_sweep = self.last_sweep + 1;
         let mut tracer = Tracer {
             new_sweep,
             object_sweeps: &mut self.object_sweeps,
             objects: &self.objects,
+            allocated: &self.allocated,
         };
 
         // Mark
-        self.rooted
-            .retain(|handle, rc| {
-                if Rc::strong_count(rc) > 1 {
-                    tracer.mark(*handle);
-                    unsafe { (&*handle.ptr).trace(&mut tracer); }
-                    true
-                } else {
-                    false
-                }
-            });
         let objects = &self.objects;
+        self.rooted.retain(|index, rc| {
+            if Arc::strong_count(rc) > 1 {
+                tracer.mark(*index);
+                if let Some(obj) = &objects.get(*index) {
+                    //obj.borrow().trace(&mut tracer);
+                    // XXX FIX ME
+                    obj.read().unwrap().trace(&mut tracer);
+                }
+                true
+            } else {
+                false
+            }
+        });
+        let allocated = &self.allocated;
         excluding
             .into_iter()
-            .filter(|handle| objects.contains(&handle))
+            .filter(|handle| allocated.contains(&handle.idx))
             .for_each(|handle| {
-                tracer.mark(handle);
-                unsafe { (&*handle.ptr).trace(&mut tracer); }
+                tracer.mark(handle.idx);
+                if let Some(obj) = &objects.get(handle.idx) {
+                    //obj.borrow().trace(&mut tracer);
+                    // XXX FIX ME
+                    obj.read().unwrap().trace(&mut tracer);
+                }
             });
 
         // Sweep
-        let object_sweeps = &mut self.object_sweeps;
-        self.objects
-            .retain(|handle| {
-                if object_sweeps
-                    .get(handle)
-                    .map(|sweep| *sweep == new_sweep)
-                    .unwrap_or(false)
-                {
-                    true
-                } else {
-                    object_sweeps.remove(handle);
-                    drop(unsafe { Box::from_raw(handle.ptr) });
-                    false
-                }
-            });
+        for (i, _obj) in self.objects.iter().enumerate() {
+            if !self
+                .object_sweeps
+                .get(&i)
+                .map(|sweep| *sweep == new_sweep)
+                .unwrap_or(false)
+            {
+                self.object_sweeps.remove(&i);
+                self.allocated.remove(&i);
+                self.freed.push(i);
+            }
+        }
 
         self.last_sweep = new_sweep;
     }
@@ -266,77 +263,29 @@ impl<T: Trace<T>> Heap<T> {
     }
 }
 
-impl<T> Drop for Heap<T> {
-    fn drop(&mut self) {
-        for handle in &self.objects {
-            drop(unsafe { Box::from_raw(handle.ptr) });
-        }
-    }
-}
-
 /// A handle to a heap object.
 ///
 /// [`Handle`] may be cheaply copied as is necessary to serve your needs. It's even legal for it
 /// to outlive the object it refers to, provided it is no longer used to access it afterwards.
 #[derive(Debug)]
 pub struct Handle<T> {
-    gen: Generation,
-    ptr: *mut T,
+    idx: usize,
+    _marker: std::marker::PhantomData<T>,
 }
 
-impl<T> Handle<T> {
-    /// Get a reference to the object this handle refers to without checking any invariants.
-    ///
-    /// **You almost certainly do not want to use this function: consider [`Heap::get`] or
-    /// [`Heap::get_unchecked`] instead; both are safer than this function.**
-    ///
-    /// The following invariants must be upheld by you, the responsible programmer:
-    ///
-    /// - The object *must* still be alive (i.e: accessible from the heap it was created on)
-    /// - The object *must not* be mutably accessible elsewhere (i.e: has any live references to
-    ///   it) by any other part of the program. Immutable references are permitted. Other handles
-    ///   (i.e: [`Handle`] or [`Rooted`] are also permitted, provided they are not in use.
-    /// - That a garbage collection of the heap this object belongs to does not occur while the
-    ///   reference this function creates is live.
-    ///
-    /// If *any* of these invariants are not upheld, undefined behaviour will result when using
-    /// this function. If all are upheld, this function provides zero-cost access to underlying
-    /// object.
-    pub unsafe fn get_unchecked(&self) -> &T {
-        &*self.ptr
-    }
-
-    /// Get a mutable reference to the object this handle refers to without checking any
-    /// invariants.
-    ///
-    /// **You almost certainly do not want to use this function: consider [`Heap::mutate`] or
-    /// [`Heap::mutate_unchecked`] instead; both are safer than this function.**
-    ///
-    /// The following invariants must be upheld by you, the responsible programmer:
-    ///
-    /// - The object *must* still be alive (i.e: accessible from the heap it was created on)
-    /// - The object *must not* be accessible elsewhere (i.e: has any live references to it),
-    ///   either mutably or immutably, by any other part of the program. Other handles (i.e:
-    ///   [`Handle`] or [`Rooted`] are permitted, provided they are not in use.
-    /// - That a garbage collection of the heap this object belongs to does not occur while the
-    ///   reference this function creates is live.
-    ///
-    /// If *any* of these invariants are not upheld, undefined behaviour will result when using
-    /// this function. If all are upheld, this function provides zero-cost access to underlying
-    /// object.
-    pub unsafe fn get_mut_unchecked(&self) -> &mut T {
-        &mut *self.ptr
-    }
-}
+impl<T: Trace<T>> Handle<T> {}
 
 impl<T> Copy for Handle<T> {}
 impl<T> Clone for Handle<T> {
-    fn clone(&self) -> Self {
-        Self { gen: self.gen, ptr: self.ptr }
+    fn clone(&self) -> Handle<T> {
+        Handle {
+            idx: self.idx,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
-impl<T> PartialEq<Self> for Handle<T> {
+/*impl<T> PartialEq<Self> for Handle<T> {
     fn eq(&self, other: &Self) -> bool {
         self.gen == other.gen && self.ptr == other.ptr
     }
@@ -348,7 +297,7 @@ impl<T> Hash for Handle<T> {
         self.gen.hash(state);
         self.ptr.hash(state);
     }
-}
+}*/
 
 impl<T> AsRef<Handle<T>> for Handle<T> {
     fn as_ref(&self) -> &Handle<T> {
@@ -362,6 +311,72 @@ impl<T> From<Rooted<T>> for Handle<T> {
     }
 }
 
+pub struct Obj<'a, T> {
+    _obj: Arc<RwLock<T>>,
+    read: RwLockReadGuard<'a, T>,
+}
+
+impl<'a, T> Obj<'a, T> {
+    fn new_lifetime(obj: &Arc<RwLock<T>>) -> &'a Arc<RwLock<T>> {
+        unsafe { &*(obj as *const Arc<RwLock<T>>) }
+    }
+
+    fn new(obj: Arc<RwLock<T>>) -> Obj<'a, T> {
+        let read = Obj::new_lifetime(&obj).try_read().expect("Heap has poisoned data, done!");
+        Obj { _obj: obj, read }
+    }
+
+    pub fn data<'b>(&'b self) -> &'b T where 'a: 'b {
+        &*self.read
+    }
+}
+
+impl<'a, T> Deref for Obj<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.read
+    }
+}
+
+pub struct ObjMut<'a, T> {
+    _obj: Arc<RwLock<T>>,
+    write: RwLockWriteGuard<'a, T>,
+}
+
+impl<'a, T> ObjMut<'a, T> {
+    fn new_lifetime(obj: &Arc<RwLock<T>>) -> &'a Arc<RwLock<T>> {
+        unsafe { &*(obj as *const Arc<RwLock<T>>) }
+    }
+
+    fn new(obj: Arc<RwLock<T>>) -> ObjMut<'a, T> {
+        let write = ObjMut::new_lifetime(&obj).try_write().expect("Heap has poisoned data, done!");
+        ObjMut { _obj: obj, write }
+    }
+
+    pub fn data<'b>(&'b self) -> &'b T where 'a: 'b {
+        &*self.write
+    }
+
+    pub fn data_mut<'b>(&'b mut self) -> &'b mut T where 'a: 'b {
+        &mut *self.write
+    }
+}
+
+impl<'a, T> Deref for ObjMut<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.write
+    }
+}
+
+impl<'a, T> DerefMut for ObjMut<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.write
+    }
+}
+
 /// A handle to a heap object that guarantees the object will not be cleaned up by the garbage
 /// collector.
 ///
@@ -371,11 +386,12 @@ impl<T> From<Rooted<T>> for Handle<T> {
 pub struct Rooted<T> {
     // TODO: Is an Rc the best we can do? It might be better instead to store the strong count with
     // the object to avoid an extra allocation.
-    rc: Rc<()>,
+    //rc: Rc<()>,
+    rc: Arc<()>,
     handle: Handle<T>,
 }
 
-impl<T> Clone for Rooted<T> {
+impl<T: Trace<T>> Clone for Rooted<T> {
     fn clone(&self) -> Self {
         Self {
             rc: self.rc.clone(),
@@ -390,13 +406,17 @@ impl<T> AsRef<Handle<T>> for Rooted<T> {
     }
 }
 
-impl<T> Rooted<T> {
+impl<T: Trace<T>> Rooted<T> {
     pub fn into_handle(self) -> Handle<T> {
         self.handle
     }
 
     pub fn handle(&self) -> Handle<T> {
         self.handle
+    }
+
+    pub fn rc(&self) -> Arc<()> {
+        self.rc.clone()
     }
 }
 
@@ -413,11 +433,11 @@ mod tests {
     impl<'a> Trace<Self> for Value<'a> {
         fn trace(&self, tracer: &mut Tracer<Self>) {
             match self {
-                Value::Base(_) => {},
+                Value::Base(_) => {}
                 Value::Refs(_, a, b) => {
                     a.trace(tracer);
                     b.trace(tracer);
-                },
+                }
             }
         }
     }
@@ -425,8 +445,9 @@ mod tests {
     impl<'a> Drop for Value<'a> {
         fn drop(&mut self) {
             match self {
-                Value::Base(count) | Value::Refs(count, _, _) =>
-                    count.fetch_sub(1, Ordering::Relaxed),
+                Value::Base(count) | Value::Refs(count, _, _) => {
+                    count.fetch_sub(1, Ordering::Relaxed)
+                }
             };
         }
     }
@@ -486,7 +507,6 @@ mod tests {
         let a = heap.insert_temp(Value::Base(new_count()));
 
         heap.clean();
-
         assert_eq!(heap.contains(&a), false);
 
         let a = heap.insert_temp(Value::Base(new_count()));

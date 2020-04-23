@@ -57,18 +57,18 @@ pub mod trace;
 use crate::trace::*;
 use hashbrown::{HashMap, HashSet};
 use std::{
-    //cell::{Ref, RefCell, RefMut},
-    sync::{Arc, RwLock, RwLockWriteGuard, RwLockReadGuard},
+    hash::{Hash, Hasher},
     //rc::Rc,
     ops::{Deref, DerefMut},
-    hash::{Hash, Hasher},
+    //cell::{Ref, RefCell, RefMut},
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 /// Common items that you'll probably need often.
 pub mod prelude {
     pub use super::{
         trace::{Trace, Tracer},
-        Handle, Heap, Rooted, Obj, ObjMut
+        Handle, Heap, Obj, ObjMut, Rooted,
     };
 }
 
@@ -87,7 +87,8 @@ pub struct Heap<T> {
     allocated: HashSet<usize>,
     freed: Vec<usize>,
     //rooted: HashMap<usize, Rc<()>>,
-    rooted: HashMap<usize, Arc<()>>,
+    rooted: HashMap<HandleRef, Arc<()>>,
+    refs: HashMap<Handle<T>, HandleRef>,
 }
 
 impl<T> Default for Heap<T> {
@@ -99,21 +100,28 @@ impl<T> Default for Heap<T> {
             allocated: HashSet::default(),
             freed: Vec::default(),
             rooted: HashMap::default(),
+            refs: HashMap::default(),
         }
     }
 }
 
 impl<T: Trace<T>> Heap<T> {
     /// Create an empty heap.
-    pub fn new() -> Self { Self::default() } 
-    
-    pub fn objects(&self) -> usize { self.objects.len() }
-    pub fn free_objects(&self) -> usize { self.freed.len() }
-    pub fn used_objects(&self) -> usize { self.objects() - self.free_objects() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    /// Adds a new object to this heap that will be cleared upon the next garbage collection, if
-    /// not attached to the object tree.
-    pub fn insert_temp(&mut self, object: T) -> Handle<T> {
+    pub fn objects(&self) -> usize {
+        self.objects.len()
+    }
+    pub fn free_objects(&self) -> usize {
+        self.freed.len()
+    }
+    pub fn used_objects(&self) -> usize {
+        self.objects() - self.free_objects()
+    }
+
+    fn insert_int(&mut self, object: T) -> (Handle<T>, HandleRef) {
         let idx = if let Some(idx) = self.freed.pop() {
             self.objects.push(Arc::new(RwLock::new(object)));
             self.objects.swap_remove(idx);
@@ -124,20 +132,29 @@ impl<T: Trace<T>> Heap<T> {
             self.objects.len() - 1
         };
         self.allocated.insert(idx);
-
-        Handle {
+        let handle = Handle {
             idx,
             _marker: std::marker::PhantomData,
-        }
+        };
+        let href = HandleRef { idx };
+        self.refs.insert(handle, href);
+        (handle, href)
+    }
+
+    /// Adds a new object to this heap that will be cleared upon the next garbage collection, if
+    /// not attached to the object tree.
+    pub fn insert_temp(&mut self, object: T) -> Handle<T> {
+        let (handle, _) = self.insert_int(object);
+        handle
     }
 
     /// Adds a new object to this heap that will not be cleared by garbage collection until all
     /// rooted handles have been dropped.
     pub fn insert(&mut self, object: T) -> Rooted<T> {
-        let handle = self.insert_temp(object);
+        let (handle, href) = self.insert_int(object);
 
         let rc = Arc::new(());
-        self.rooted.insert(handle.idx, rc.clone());
+        self.rooted.insert(href, rc.clone());
 
         Rooted { rc, handle }
     }
@@ -148,13 +165,17 @@ impl<T: Trace<T>> Heap<T> {
         let handle = handle.as_ref();
         debug_assert!(self.contains(handle));
 
+        if let Some(href) = self.refs.get(handle) {
         Rooted {
             rc: self
                 .rooted
-                .entry(handle.idx)
+                .entry(*href)
                 .or_insert_with(|| Arc::new(()))
                 .clone(),
             handle: *handle,
+        }
+        } else {
+            panic!("Not a valid handle!");
         }
     }
 
@@ -176,8 +197,12 @@ impl<T: Trace<T>> Heap<T> {
     /// Get a reference to a heap object if it exists on this heap.
     pub fn get(&self, handle: impl AsRef<Handle<T>>) -> Option<Obj<T>> {
         let handle = handle.as_ref();
-        if let Some(obj) = self.objects.get(handle.idx) {
-            Some(Obj::new(obj.clone()))
+        if let Some(href) = self.refs.get(handle) {
+            if let Some(obj) = self.objects.get(href.idx) {
+                Some(Obj::new(obj.clone()))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -186,8 +211,12 @@ impl<T: Trace<T>> Heap<T> {
     /// Get a mutable reference to a heap object
     pub fn get_mut(&self, handle: impl AsRef<Handle<T>>) -> Option<ObjMut<T>> {
         let handle = handle.as_ref();
-        if let Some(obj) = self.objects.get(handle.idx) {
-            Some(ObjMut::new(obj.clone()))
+        if let Some(href) = self.refs.get(handle) {
+            if let Some(obj) = self.objects.get(href.idx) {
+                Some(ObjMut::new(obj.clone()))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -211,14 +240,15 @@ impl<T: Trace<T>> Heap<T> {
             object_sweeps: &mut self.object_sweeps,
             objects: &self.objects,
             allocated: &self.allocated,
+            refs: &self.refs,
         };
 
         // Mark
         let objects = &self.objects;
-        self.rooted.retain(|index, rc| {
+        self.rooted.retain(|href, rc| {
             if Arc::strong_count(rc) > 1 {
-                tracer.mark(*index);
-                if let Some(obj) = &objects.get(*index) {
+                tracer.mark(href);
+                if let Some(obj) = &objects.get(href.idx) {
                     //obj.borrow().trace(&mut tracer);
                     // XXX FIX ME
                     obj.read().unwrap().trace(&mut tracer);
@@ -233,7 +263,7 @@ impl<T: Trace<T>> Heap<T> {
             .into_iter()
             .filter(|handle| allocated.contains(&handle.idx))
             .for_each(|handle| {
-                tracer.mark(handle.idx);
+                tracer.mark_handle(&handle);
                 if let Some(obj) = &objects.get(handle.idx) {
                     //obj.borrow().trace(&mut tracer);
                     // XXX FIX ME
@@ -250,7 +280,7 @@ impl<T: Trace<T>> Heap<T> {
                 .unwrap_or(false)
             {
                 self.object_sweeps.remove(&i);
-                if self.allocated.contains(&i) {//in_use {
+                if self.allocated.contains(&i) {
                     self.freed.push(i);
                     self.allocated.remove(&i);
                 }
@@ -265,6 +295,25 @@ impl<T: Trace<T>> Heap<T> {
         self.clean_excluding(std::iter::empty());
     }
 }
+
+#[derive(Clone,Copy)]
+pub struct HandleRef {
+    idx: usize,
+}
+impl PartialEq<Self> for HandleRef {
+    fn eq(&self, other: &Self) -> bool {
+        //self.gen == other.gen && self.ptr == other.ptr
+        self.idx == other.idx
+    }
+}
+impl Eq for HandleRef {}
+
+impl Hash for HandleRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.idx.hash(state);
+    }
+}
+
 
 /// A handle to a heap object.
 ///
@@ -327,11 +376,16 @@ impl<'a, T> Obj<'a, T> {
     }
 
     fn new(obj: Arc<RwLock<T>>) -> Obj<'a, T> {
-        let read = Obj::new_lifetime(&obj).read().expect("Heap has poisoned data, done!");
+        let read = Obj::new_lifetime(&obj)
+            .read()
+            .expect("Heap has poisoned data, done!");
         Obj { _obj: obj, read }
     }
 
-    pub fn data<'b>(&'b self) -> &'b T where 'a: 'b {
+    pub fn data<'b>(&'b self) -> &'b T
+    where
+        'a: 'b,
+    {
         &*self.read
     }
 }
@@ -355,15 +409,23 @@ impl<'a, T> ObjMut<'a, T> {
     }
 
     fn new(obj: Arc<RwLock<T>>) -> ObjMut<'a, T> {
-        let write = ObjMut::new_lifetime(&obj).try_write().expect("Heap has poisoned data, done!");
+        let write = ObjMut::new_lifetime(&obj)
+            .try_write()
+            .expect("Heap has poisoned data, done!");
         ObjMut { _obj: obj, write }
     }
 
-    pub fn data<'b>(&'b self) -> &'b T where 'a: 'b {
+    pub fn data<'b>(&'b self) -> &'b T
+    where
+        'a: 'b,
+    {
         &*self.write
     }
 
-    pub fn data_mut<'b>(&'b mut self) -> &'b mut T where 'a: 'b {
+    pub fn data_mut<'b>(&'b mut self) -> &'b mut T
+    where
+        'a: 'b,
+    {
         &mut *self.write
     }
 }

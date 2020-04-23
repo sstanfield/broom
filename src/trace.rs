@@ -45,26 +45,35 @@ pub struct Tracer<'a, T: Trace<T>> {
     //pub(crate) objects: &'a Vec<RefCell<T>>,
     pub(crate) objects: &'a Vec<Arc<RwLock<T>>>,
     pub(crate) allocated: &'a HashSet<usize>,
+    pub(crate) refs: &'a HashMap<Handle<T>, HandleRef>,
 }
 
 impl<'a, T: Trace<T>> Tracer<'a, T> {
-    pub(crate) fn mark(&mut self, index: usize) {
+    pub(crate) fn mark(&mut self, href: &HandleRef) {
         let sweep = self
             .object_sweeps
-            .entry(index)
+            .entry(href.idx)
             .or_insert(self.new_sweep - 1);
-        if *sweep != self.new_sweep && self.allocated.contains(&index) {
+        if *sweep != self.new_sweep && self.allocated.contains(&href.idx) {
             *sweep = self.new_sweep;
             //self.objects[index].borrow().trace(self);
             //XXX FIX ME
-            self.objects[index].read().unwrap().trace(self);
+            self.objects[href.idx].read().unwrap().trace(self);
+        }
+    }
+
+    pub(crate) fn mark_handle(&mut self, handle: &Handle<T>) {
+        if let Some(href) = self.refs.get(handle) {
+            self.mark(&href);
         }
     }
 }
 
 impl<O: Trace<O>> Trace<O> for Handle<O> {
     fn trace(&self, tracer: &mut Tracer<O>) {
-        tracer.mark(self.idx);
+        if let Some(href) = tracer.refs.get(self) {
+            tracer.mark(&href);
+        }
     }
 }
 

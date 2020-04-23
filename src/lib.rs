@@ -61,6 +61,7 @@ use std::{
     sync::{Arc, RwLock, RwLockWriteGuard, RwLockReadGuard},
     //rc::Rc,
     ops::{Deref, DerefMut},
+    hash::{Hash, Hasher},
 };
 
 /// Common items that you'll probably need often.
@@ -105,6 +106,11 @@ impl<T> Default for Heap<T> {
 impl<T: Trace<T>> Heap<T> {
     /// Create an empty heap.
     pub fn new() -> Self { Self::default() } 
+    
+    pub fn objects(&self) -> usize { self.objects.len() }
+    pub fn free_objects(&self) -> usize { self.freed.len() }
+    pub fn used_objects(&self) -> usize { self.objects() - self.free_objects() }
+
     /// Adds a new object to this heap that will be cleared upon the next garbage collection, if
     /// not attached to the object tree.
     pub fn insert_temp(&mut self, object: T) -> Handle<T> {
@@ -166,11 +172,6 @@ impl<T: Trace<T>> Heap<T> {
         let handle = handle.as_ref();
         self.allocated.contains(&handle.idx)
     }
-
-    /*pub fn get_obj(&self, handle: impl AsRef<Handle<T>>) -> Arc<RwLock<T>> {
-        let handle = handle.as_ref();
-        self.objects.get(handle.idx).expect("Invalid handle!").clone()
-    }*/
 
     /// Get a reference to a heap object if it exists on this heap.
     pub fn get(&self, handle: impl AsRef<Handle<T>>) -> Option<Obj<T>> {
@@ -249,8 +250,10 @@ impl<T: Trace<T>> Heap<T> {
                 .unwrap_or(false)
             {
                 self.object_sweeps.remove(&i);
-                self.allocated.remove(&i);
-                self.freed.push(i);
+                if self.allocated.contains(&i) {//in_use {
+                    self.freed.push(i);
+                    self.allocated.remove(&i);
+                }
             }
         }
 
@@ -285,19 +288,21 @@ impl<T> Clone for Handle<T> {
     }
 }
 
-/*impl<T> PartialEq<Self> for Handle<T> {
+impl<T> PartialEq<Self> for Handle<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.gen == other.gen && self.ptr == other.ptr
+        //self.gen == other.gen && self.ptr == other.ptr
+        self.idx == other.idx
     }
 }
 impl<T> Eq for Handle<T> {}
 
 impl<T> Hash for Handle<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.gen.hash(state);
-        self.ptr.hash(state);
+        //self.gen.hash(state);
+        //self.ptr.hash(state);
+        self.idx.hash(state);
     }
-}*/
+}
 
 impl<T> AsRef<Handle<T>> for Handle<T> {
     fn as_ref(&self) -> &Handle<T> {
@@ -322,7 +327,7 @@ impl<'a, T> Obj<'a, T> {
     }
 
     fn new(obj: Arc<RwLock<T>>) -> Obj<'a, T> {
-        let read = Obj::new_lifetime(&obj).try_read().expect("Heap has poisoned data, done!");
+        let read = Obj::new_lifetime(&obj).read().expect("Heap has poisoned data, done!");
         Obj { _obj: obj, read }
     }
 

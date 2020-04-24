@@ -42,23 +42,22 @@ pub trait Trace<T: Trace<T>> {
 pub struct Tracer<'a, T: Trace<T>> {
     pub(crate) new_sweep: usize,
     pub(crate) object_sweeps: &'a mut HashMap<usize, usize>,
-    //pub(crate) objects: &'a Vec<RefCell<T>>,
-    pub(crate) objects: &'a Vec<Arc<RwLock<T>>>,
-    pub(crate) allocated: &'a HashSet<usize>,
-    pub(crate) refs: &'a HashMap<Handle<T>, HandleRef>,
+    pub(crate) objects: &'a RwLock<Vec<Option<Arc<RwLock<T>>>>>,
+    pub(crate) refs: &'a HashMap<Handle<T>, HandleRef<T>>,
 }
 
 impl<'a, T: Trace<T>> Tracer<'a, T> {
-    pub(crate) fn mark(&mut self, href: &HandleRef) {
+    pub(crate) fn mark(&mut self, href: &HandleRef<T>) {
         let sweep = self
             .object_sweeps
             .entry(href.idx)
             .or_insert(self.new_sweep - 1);
-        if *sweep != self.new_sweep && self.allocated.contains(&href.idx) {
+        if *sweep != self.new_sweep {
             *sweep = self.new_sweep;
-            //self.objects[index].borrow().trace(self);
             //XXX FIX ME
-            self.objects[href.idx].read().unwrap().trace(self);
+            if let Some(obj) = &self.objects.read().unwrap()[href.idx] {
+                obj.read().unwrap().trace(self);
+            }
         }
     }
 

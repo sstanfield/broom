@@ -56,6 +56,7 @@ pub mod trace;
 
 use crate::trace::*;
 use hashbrown::{HashMap, HashSet};
+//use std::collections::{HashMap, HashSet};
 use std::{
     hash::{Hash, Hasher},
     //rc::Rc,
@@ -82,13 +83,10 @@ pub mod prelude {
 pub struct Heap<T> {
     last_sweep: usize,
     object_sweeps: HashMap<usize, usize>,
-    //objects: Vec<RefCell<T>>,
-    objects: Vec<Arc<RwLock<T>>>,
-    allocated: HashSet<usize>,
+    objects: RwLock<Vec<Option<Arc<RwLock<T>>>>>,
     freed: Vec<usize>,
-    //rooted: HashMap<usize, Rc<()>>,
-    rooted: HashMap<HandleRef, Arc<()>>,
-    refs: HashMap<Handle<T>, HandleRef>,
+    rooted: HashMap<HandleRef<T>, Arc<()>>,
+    refs: HashMap<Handle<T>, HandleRef<T>>,
 }
 
 impl<T> Default for Heap<T> {
@@ -96,8 +94,7 @@ impl<T> Default for Heap<T> {
         Self {
             last_sweep: 0,
             object_sweeps: HashMap::default(),
-            objects: Vec::default(),
-            allocated: HashSet::default(),
+            objects: RwLock::new(Vec::default()),
             freed: Vec::default(),
             rooted: HashMap::default(),
             refs: HashMap::default(),
@@ -112,7 +109,7 @@ impl<T: Trace<T>> Heap<T> {
     }
 
     pub fn objects(&self) -> usize {
-        self.objects.len()
+        self.objects.read().unwrap().len()
     }
     pub fn free_objects(&self) -> usize {
         self.freed.len()
@@ -121,22 +118,28 @@ impl<T: Trace<T>> Heap<T> {
         self.objects() - self.free_objects()
     }
 
-    fn insert_int(&mut self, object: T) -> (Handle<T>, HandleRef) {
+    fn insert_int(&mut self, object: T) -> (Handle<T>, HandleRef<T>) {
         let idx = if let Some(idx) = self.freed.pop() {
-            self.objects.push(Arc::new(RwLock::new(object)));
-            self.objects.swap_remove(idx);
-            //self.objects[idx].replace(object);
+            if let Ok(mut objects) = self.objects.write() {
+            objects.push(Some(Arc::new(RwLock::new(object))));
+            objects.swap_remove(idx);
             idx
+            } else {
+                panic!("Poisoned objects list!");
+            }
         } else {
-            self.objects.push(Arc::new(RwLock::new(object)));
-            self.objects.len() - 1
+            if let Ok(mut objects) = self.objects.write() {
+            objects.push(Some(Arc::new(RwLock::new(object))));
+            objects.len() - 1
+            } else {
+                panic!("Poisoned objects list!");
+            }
         };
-        self.allocated.insert(idx);
         let handle = Handle {
             idx,
             _marker: std::marker::PhantomData,
         };
-        let href = HandleRef { idx };
+        let href = HandleRef { handle, idx };
         self.refs.insert(handle, href);
         (handle, href)
     }
@@ -181,25 +184,33 @@ impl<T: Trace<T>> Heap<T> {
 
     /// Count the number of heap-allocated objects in this heap
     pub fn len(&self) -> usize {
-        self.objects.len()
+        self.objects.read().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.objects.is_empty()
+        self.objects.read().unwrap().is_empty()
     }
 
     /// Return true if the heap contains the specified handle
     pub fn contains(&self, handle: impl AsRef<Handle<T>>) -> bool {
         let handle = handle.as_ref();
-        self.allocated.contains(&handle.idx)
+        if let Some(href) = self.refs.get(handle) {
+            self.objects.read().expect("Poisoned object list!").get(href.idx).expect("Invalid handle!").is_some()
+        } else {
+            false
+        }
     }
 
     /// Get a reference to a heap object if it exists on this heap.
     pub fn get(&self, handle: impl AsRef<Handle<T>>) -> Option<Obj<T>> {
         let handle = handle.as_ref();
         if let Some(href) = self.refs.get(handle) {
-            if let Some(obj) = self.objects.get(href.idx) {
+            if let Some(obj) = self.objects.read().unwrap().get(href.idx) {
+                if let Some(obj) = obj {
                 Some(Obj::new(obj.clone()))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -212,8 +223,12 @@ impl<T: Trace<T>> Heap<T> {
     pub fn get_mut(&self, handle: impl AsRef<Handle<T>>) -> Option<ObjMut<T>> {
         let handle = handle.as_ref();
         if let Some(href) = self.refs.get(handle) {
-            if let Some(obj) = self.objects.get(href.idx) {
+            if let Some(obj) = self.objects.read().unwrap().get(href.idx) {
+                if let Some(obj) = obj {
                 Some(ObjMut::new(obj.clone()))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -239,7 +254,6 @@ impl<T: Trace<T>> Heap<T> {
             new_sweep,
             object_sweeps: &mut self.object_sweeps,
             objects: &self.objects,
-            allocated: &self.allocated,
             refs: &self.refs,
         };
 
@@ -248,31 +262,33 @@ impl<T: Trace<T>> Heap<T> {
         self.rooted.retain(|href, rc| {
             if Arc::strong_count(rc) > 1 {
                 tracer.mark(href);
-                if let Some(obj) = &objects.get(href.idx) {
+                if let Some(obj) = &objects.read().unwrap().get(href.idx) {
                     //obj.borrow().trace(&mut tracer);
                     // XXX FIX ME
+                    if let Some(obj) = obj {
                     obj.read().unwrap().trace(&mut tracer);
+                    }
                 }
                 true
             } else {
                 false
             }
         });
-        let allocated = &self.allocated;
         excluding
             .into_iter()
-            .filter(|handle| allocated.contains(&handle.idx))
             .for_each(|handle| {
                 tracer.mark_handle(&handle);
-                if let Some(obj) = &objects.get(handle.idx) {
+                if let Some(obj) = &objects.read().unwrap().get(handle.idx) {
                     //obj.borrow().trace(&mut tracer);
                     // XXX FIX ME
-                    obj.read().unwrap().trace(&mut tracer);
+                    if let Some(obj) = obj {
+                        obj.read().unwrap().trace(&mut tracer);
+                    }
                 }
             });
 
         // Sweep
-        for (i, _obj) in self.objects.iter().enumerate() {
+        for (i, obj) in self.objects.write().unwrap().iter_mut().enumerate() {
             if !self
                 .object_sweeps
                 .get(&i)
@@ -280,9 +296,10 @@ impl<T: Trace<T>> Heap<T> {
                 .unwrap_or(false)
             {
                 self.object_sweeps.remove(&i);
-                if self.allocated.contains(&i) {
+                if obj.is_some() {
                     self.freed.push(i);
-                    self.allocated.remove(&i);
+                    *obj = None;
+                    self.refs.remove(&Handle { idx: i, _marker: std::marker::PhantomData });
                 }
             }
         }
@@ -296,21 +313,32 @@ impl<T: Trace<T>> Heap<T> {
     }
 }
 
-#[derive(Clone,Copy)]
-pub struct HandleRef {
+pub struct HandleRef<T> {
+    handle: Handle<T>,
     idx: usize,
 }
-impl PartialEq<Self> for HandleRef {
-    fn eq(&self, other: &Self) -> bool {
-        //self.gen == other.gen && self.ptr == other.ptr
-        self.idx == other.idx
+
+impl<T> Copy for HandleRef<T> {}
+impl<T> Clone for HandleRef<T> {
+    fn clone(&self) -> HandleRef<T> {
+        HandleRef {
+            handle: self.handle,
+            idx: self.idx,
+        }
     }
 }
-impl Eq for HandleRef {}
 
-impl Hash for HandleRef {
+impl<T> PartialEq<Self> for HandleRef<T> {
+    fn eq(&self, other: &Self) -> bool {
+        //self.gen == other.gen && self.ptr == other.ptr
+        self.handle == other.handle
+    }
+}
+impl<T> Eq for HandleRef<T> {}
+
+impl<T> Hash for HandleRef<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.idx.hash(state);
+        self.handle.hash(state);
     }
 }
 
